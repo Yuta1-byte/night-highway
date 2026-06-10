@@ -1,0 +1,929 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>NIGHT HIGHWAY</title>
+<style>
+  :root{
+    --ink:#0b0e14;
+    --amber:#f2a33c;
+    --text:#c8cedb;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%;overflow:hidden;background:var(--ink);
+    font-family:"Hiragino Kaku Gothic ProN","Yu Gothic",system-ui,sans-serif;
+    touch-action:none;user-select:none;-webkit-user-select:none}
+  #wrap{position:fixed;inset:0}
+  canvas{display:block;width:100%;height:100%}
+
+  /* HUD */
+  #hud{position:absolute;top:max(12px,env(safe-area-inset-top));left:0;right:0;
+    display:flex;justify-content:space-between;padding:0 20px;pointer-events:none;
+    color:var(--text);font-variant-numeric:tabular-nums;
+    text-shadow:0 1px 6px rgba(0,0,0,.6)}
+  .hud-item.right{text-align:right}
+  .hud-label{font-size:10px;letter-spacing:.25em;color:#7a839a}
+  .hud-value{font-size:26px;font-weight:200;letter-spacing:.05em;line-height:1.15}
+  .hud-value .unit{font-size:11px;color:#7a839a;margin-left:2px;letter-spacing:.1em}
+
+  /* オーバーレイ */
+  #overlay{position:absolute;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:14px;
+    background:rgba(11,14,20,.72);backdrop-filter:blur(3px);
+    color:var(--text);text-align:center;transition:opacity .35s}
+  #overlay.hidden{opacity:0;pointer-events:none}
+  #ttl{font-size:13px;letter-spacing:.55em;color:#8a93a8;margin-left:.55em}
+  #big{font-size:42px;font-weight:100;letter-spacing:.18em;margin-left:.18em;
+    text-shadow:0 0 30px rgba(242,163,60,.25)}
+  #big em{font-style:normal;color:var(--amber)}
+  #sub{font-size:12px;color:#7a839a;letter-spacing:.12em;line-height:2}
+  #score-line{font-size:14px;letter-spacing:.2em;color:var(--text)}
+  #score-line b{color:var(--amber);font-weight:400}
+  #tap{margin-top:18px;font-size:12px;letter-spacing:.3em;color:var(--amber);
+    border:1px solid rgba(242,163,60,.45);padding:12px 34px;border-radius:2px;
+    animation:pulse 2.2s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:.55}50%{opacity:1}}
+  @media (prefers-reduced-motion: reduce){#tap{animation:none}}
+
+  /* 操作ヒント */
+  #hint{position:absolute;bottom:max(18px,env(safe-area-inset-bottom));left:0;right:0;
+    display:flex;justify-content:space-between;padding:0 26px;pointer-events:none;
+    color:#6b7488;font-size:10px;letter-spacing:.3em;transition:opacity 1s;
+    text-shadow:0 1px 4px rgba(0,0,0,.8)}
+  #hint.hidden{opacity:0}
+
+  /* サウンド切替 */
+  #snd{position:absolute;top:max(14px,env(safe-area-inset-top));left:50%;
+    transform:translateX(-50%);
+    background:none;border:none;color:#7a839a;font-size:10px;letter-spacing:.3em;
+    padding:6px 12px;cursor:pointer;z-index:5;
+    font-family:inherit}
+  #snd.off{color:#454e63;text-decoration:line-through}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv"></canvas>
+
+  <div id="hud">
+    <div class="hud-item">
+      <div class="hud-label">SPEED</div>
+      <div class="hud-value"><span id="spd">0</span><span class="unit">km/h</span></div>
+    </div>
+    <div class="hud-item right">
+      <div class="hud-label">DISTANCE</div>
+      <div class="hud-value"><span id="dist">0.0</span><span class="unit">km</span></div>
+    </div>
+  </div>
+
+  <button id="snd">SOUND ON</button>
+
+  <div id="hint" class="hidden">
+    <span>◀ 左をタッチ</span><span>右をタッチ ▶</span>
+  </div>
+
+  <div id="overlay">
+    <div id="ttl">— 夜 行 —</div>
+    <div id="big">NIGHT <em>HIGHWAY</em></div>
+    <div id="sub">画面の左右を押さえてステアリング<br>前を走る車をかわし、距離を伸ばす</div>
+    <div id="score-line" style="display:none"></div>
+    <div id="tap">タップしてスタート</div>
+  </div>
+</div>
+
+<script>
+(() => {
+"use strict";
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+let W=0, H=0, DPR=1;
+
+/* ====================================================
+   オーディオ:BGM(シンセウェイブ)+ 効果音
+==================================================== */
+const AC = window.AudioContext || window.webkitAudioContext;
+let actx=null, master=null, musicBus=null, sfxBus=null;
+let soundOn = true;
+let engine = null;          // エンジン音ノード群
+let offroadNoise = null;    // 路肩ノイズ
+let seqTimer = null, step=0, nextNoteTime=0;
+
+const BPM = 84;
+const STEP_DUR = 60/BPM/2;           // 8分音符
+const m2f = m => 440 * Math.pow(2,(m-69)/12);
+
+/* Am – F – C – G(各1小節)*/
+const CHORDS = [
+  { root:45, tones:[57,60,64] },   // A
+  { root:41, tones:[53,57,60] },   // F
+  { root:48, tones:[60,64,67] },   // C
+  { root:43, tones:[55,59,62] },   // G
+];
+const ARP_PAT = [0,1,2,1, 0,2,1,2]; // コードトーンのインデックス
+
+function makeNoiseBuffer(sec){
+  const len = Math.floor(actx.sampleRate*sec);
+  const buf = actx.createBuffer(1,len,actx.sampleRate);
+  const d = buf.getChannelData(0);
+  for(let i=0;i<len;i++) d[i] = Math.random()*2-1;
+  return buf;
+}
+
+function initAudio(){
+  if(actx) return;
+  actx = new AC();
+  master = actx.createGain();
+  master.gain.value = soundOn ? 1 : 0;
+  master.connect(actx.destination);
+
+  musicBus = actx.createGain(); musicBus.gain.value = 0.9;
+  sfxBus   = actx.createGain(); sfxBus.gain.value = 1.0;
+  musicBus.connect(master); sfxBus.connect(master);
+
+  buildEngineSound();
+  buildOffroadNoise();
+  startSequencer();
+}
+
+/* ---- エンジン音:速度に追従する持続音 ---- */
+function buildEngineSound(){
+  const osc1 = actx.createOscillator(); osc1.type='sawtooth'; osc1.frequency.value=40;
+  const osc2 = actx.createOscillator(); osc2.type='square';   osc2.frequency.value=40; osc2.detune.value=8;
+  const lp = actx.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=240; lp.Q.value=1.5;
+  const g  = actx.createGain(); g.gain.value=0;
+
+  const nsrc = actx.createBufferSource();
+  nsrc.buffer = makeNoiseBuffer(1.5); nsrc.loop = true;
+  const bp = actx.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=900; bp.Q.value=0.6;
+  const ng = actx.createGain(); ng.gain.value=0;
+
+  osc1.connect(lp); osc2.connect(lp); lp.connect(g); g.connect(sfxBus);
+  nsrc.connect(bp); bp.connect(ng); ng.connect(sfxBus);
+  osc1.start(); osc2.start(); nsrc.start();
+  engine = { osc1, osc2, lp, g, ng };
+}
+function updateEngine(spdRatio, on){
+  if(!engine) return;
+  const t = actx.currentTime;
+  const f = 38 + spdRatio*82;
+  engine.osc1.frequency.setTargetAtTime(f, t, 0.08);
+  engine.osc2.frequency.setTargetAtTime(f*1.5, t, 0.08);
+  engine.lp.frequency.setTargetAtTime(220 + spdRatio*700, t, 0.1);
+  engine.g.gain.setTargetAtTime(on ? 0.035 + spdRatio*0.045 : 0, t, 0.15);
+  engine.ng.gain.setTargetAtTime(on ? spdRatio*0.018 : 0, t, 0.15);
+}
+
+/* ---- 路肩走行ノイズ ---- */
+function buildOffroadNoise(){
+  const src = actx.createBufferSource();
+  src.buffer = makeNoiseBuffer(1.2); src.loop = true;
+  const lp = actx.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=320;
+  const g = actx.createGain(); g.gain.value=0;
+  src.connect(lp); lp.connect(g); g.connect(sfxBus);
+  src.start();
+  offroadNoise = { g };
+}
+function setOffroad(on){
+  if(!offroadNoise) return;
+  offroadNoise.g.gain.setTargetAtTime(on?0.12:0, actx.currentTime, 0.06);
+}
+
+/* ---- 衝突音 ---- */
+function playCrash(){
+  if(!actx) return;
+  const t = actx.currentTime;
+  // 衝撃ノイズ
+  const n = actx.createBufferSource(); n.buffer = makeNoiseBuffer(0.8);
+  const lp = actx.createBiquadFilter(); lp.type='lowpass';
+  lp.frequency.setValueAtTime(3200,t);
+  lp.frequency.exponentialRampToValueAtTime(120, t+0.7);
+  const ng = actx.createGain();
+  ng.gain.setValueAtTime(0.5,t);
+  ng.gain.exponentialRampToValueAtTime(0.001, t+0.8);
+  n.connect(lp); lp.connect(ng); ng.connect(sfxBus);
+  n.start(t); n.stop(t+0.85);
+  // 低い「ドン」
+  const o = actx.createOscillator(); o.type='sine';
+  o.frequency.setValueAtTime(130,t);
+  o.frequency.exponentialRampToValueAtTime(36, t+0.5);
+  const og = actx.createGain();
+  og.gain.setValueAtTime(0.45,t);
+  og.gain.exponentialRampToValueAtTime(0.001, t+0.6);
+  o.connect(og); og.connect(sfxBus);
+  o.start(t); o.stop(t+0.65);
+  // BGMを一瞬沈める
+  musicBus.gain.cancelScheduledValues(t);
+  musicBus.gain.setValueAtTime(musicBus.gain.value, t);
+  musicBus.gain.linearRampToValueAtTime(0.25, t+0.15);
+  musicBus.gain.linearRampToValueAtTime(0.9, t+2.4);
+}
+
+/* ---- スタート音 ---- */
+function playStart(){
+  if(!actx) return;
+  const t = actx.currentTime;
+  [880, 1174.7].forEach((f,i)=>{
+    const o = actx.createOscillator(); o.type='sine'; o.frequency.value=f;
+    const g = actx.createGain();
+    g.gain.setValueAtTime(0.0001, t+i*0.14);
+    g.gain.exponentialRampToValueAtTime(0.12, t+i*0.14+0.02);
+    g.gain.exponentialRampToValueAtTime(0.001, t+i*0.14+0.3);
+    o.connect(g); g.connect(sfxBus);
+    o.start(t+i*0.14); o.stop(t+i*0.14+0.35);
+  });
+}
+
+/* ---- BGMシーケンサ ---- */
+function startSequencer(){
+  step = 0;
+  nextNoteTime = actx.currentTime + 0.1;
+  seqTimer = setInterval(()=>{
+    while(nextNoteTime < actx.currentTime + 0.15){
+      scheduleStep(step, nextNoteTime);
+      step++;
+      nextNoteTime += STEP_DUR;
+    }
+  }, 30);
+}
+function scheduleStep(s, t){
+  const bar = Math.floor(s/8);
+  const chord = CHORDS[bar % CHORDS.length];
+  const inBar = s % 8;
+
+  // パッド:小節頭
+  if(inBar===0) playPad(chord, t, STEP_DUR*8);
+  // ベース:8分で根音(2,6拍目はオクターブ上)
+  playBass(chord.root + ((inBar===2||inBar===6)?12:0), t);
+  // アルペジオ:控えめなプラック
+  playPluck(chord.tones[ARP_PAT[inBar]] + 12, t, inBar);
+  // ハット:裏拍
+  if(inBar%2===1) playHat(t);
+}
+function playPad(chord, t, dur){
+  chord.tones.forEach(m=>{
+    [-6,6].forEach(det=>{
+      const o = actx.createOscillator(); o.type='sawtooth';
+      o.frequency.value = m2f(m); o.detune.value = det;
+      const lp = actx.createBiquadFilter(); lp.type='lowpass';
+      lp.frequency.value = 620; lp.Q.value = 0.4;
+      const g = actx.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.linearRampToValueAtTime(0.022, t+dur*0.3);
+      g.gain.setValueAtTime(0.022, t+dur*0.75);
+      g.gain.linearRampToValueAtTime(0.0001, t+dur);
+      o.connect(lp); lp.connect(g); g.connect(musicBus);
+      o.start(t); o.stop(t+dur+0.05);
+    });
+  });
+}
+function playBass(m, t){
+  const o = actx.createOscillator(); o.type='triangle';
+  o.frequency.value = m2f(m);
+  const g = actx.createGain();
+  g.gain.setValueAtTime(0.0001,t);
+  g.gain.exponentialRampToValueAtTime(0.085, t+0.015);
+  g.gain.exponentialRampToValueAtTime(0.001, t+STEP_DUR*0.92);
+  o.connect(g); g.connect(musicBus);
+  o.start(t); o.stop(t+STEP_DUR);
+}
+function playPluck(m, t, inBar){
+  const o = actx.createOscillator(); o.type='sine';
+  o.frequency.value = m2f(m);
+  const g = actx.createGain();
+  g.gain.setValueAtTime(0.0001,t);
+  g.gain.exponentialRampToValueAtTime(0.035, t+0.008);
+  g.gain.exponentialRampToValueAtTime(0.0008, t+0.34);
+  const p = actx.createStereoPanner ? actx.createStereoPanner() : null;
+  if(p){ p.pan.value = (inBar%2===0)? -0.35 : 0.35; o.connect(g); g.connect(p); p.connect(musicBus); }
+  else { o.connect(g); g.connect(musicBus); }
+  o.start(t); o.stop(t+0.4);
+}
+function playHat(t){
+  const n = actx.createBufferSource(); n.buffer = makeNoiseBuffer(0.06);
+  const hp = actx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=7000;
+  const g = actx.createGain();
+  g.gain.setValueAtTime(0.014,t);
+  g.gain.exponentialRampToValueAtTime(0.0005, t+0.05);
+  n.connect(hp); hp.connect(g); g.connect(musicBus);
+  n.start(t); n.stop(t+0.06);
+}
+
+/* サウンド切替 */
+const sndBtn = document.getElementById('snd');
+sndBtn.addEventListener('click', e=>{
+  e.stopPropagation();
+  soundOn = !soundOn;
+  sndBtn.textContent = soundOn ? 'SOUND ON' : 'SOUND OFF';
+  sndBtn.classList.toggle('off', !soundOn);
+  if(master) master.gain.setTargetAtTime(soundOn?1:0, actx.currentTime, 0.1);
+});
+sndBtn.addEventListener('touchstart', e=>e.stopPropagation(), {passive:true});
+
+/* ====================================================
+   描画リサイズと背景素材
+==================================================== */
+let stars=[], skyline=[], ridge=[];
+function resize(){
+  DPR = Math.min(window.devicePixelRatio||1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = W*DPR; cv.height = H*DPR;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  buildBackdrop();
+}
+function buildBackdrop(){
+  // 星
+  stars = [];
+  const n = Math.floor(W*H/9000);
+  for(let i=0;i<n;i++){
+    stars.push({
+      x: Math.random()*W,
+      y: Math.random()*H*0.48,
+      r: Math.random()*1.1+0.3,
+      tw: Math.random()*Math.PI*2,
+      sp: 0.5+Math.random()*1.5
+    });
+  }
+  // 街のシルエット(ループ幅 = 2W)
+  skyline = [];
+  let x = 0;
+  while(x < W*2){
+    const bw = 26 + Math.random()*60;
+    const bh = 14 + Math.random()*52;
+    const win = [];
+    const cols = Math.max(1, Math.floor(bw/14));
+    const rows = Math.max(1, Math.floor(bh/13));
+    for(let c=0;c<cols;c++)for(let r=0;r<rows;r++){
+      if(Math.random()<0.16) win.push({dx:6+c*14, dy:6+r*13});
+    }
+    skyline.push({x, w:bw, h:bh, win});
+    x += bw + 4 + Math.random()*22;
+  }
+  // 遠い山並み(ループ幅 = 2W)
+  ridge = [];
+  let rx = 0;
+  while(rx < W*2){
+    ridge.push({x:rx, h: 24 + Math.random()*46});
+    rx += 60 + Math.random()*90;
+  }
+}
+resize();
+addEventListener('resize', resize);
+
+/* ====================================================
+   ゲーム定数・状態(システムは v1 と同一)
+==================================================== */
+const SEG_LEN   = 200;
+const RUMBLE    = 3;
+const DRAW_SEGS = 90;
+const ROAD_W    = 1000;
+const CAM_H     = 950;
+const LANES     = 3;
+
+const MAX_SPEED   = 7600;
+const ACCEL       = 1900;
+const OFFROAD_DEC = 0.965;
+const STEER       = 2.6;
+const CENTRIFUGAL = 0.36;
+
+let segments = [];
+let trackLen = 0;
+let playing = false, dead = false;
+let pos=0, playerX=0, speed=0, distKm=0;
+let steer = 0;
+let traffic = [];
+let lastTime = 0;
+let shake = 0;
+let best = 0;
+let bgShift = 0;          // 背景パララックス
+let isOffroad = false;
+let globalT = 0;          // 演出用経過時間
+
+function addRoad(n, curve, ease){
+  for(let i=0;i<n;i++){
+    let c = curve||0;
+    if(ease==='in')  c = curve * (i/n);
+    if(ease==='out') c = curve * (1 - i/n);
+    segments.push({ curve:c });
+  }
+}
+function buildTrack(){
+  segments = [];
+  addRoad(60, 0);
+  addRoad(40, 2.2,'in'); addRoad(50, 2.2); addRoad(40, 2.2,'out');
+  addRoad(50, 0);
+  addRoad(35,-3.0,'in'); addRoad(60,-3.0); addRoad(35,-3.0,'out');
+  addRoad(40, 0);
+  addRoad(30, 4.0,'in'); addRoad(40, 4.0); addRoad(30, 4.0,'out');
+  addRoad(30,-1.6);
+  addRoad(60, 0);
+  addRoad(45, 3.2,'in'); addRoad(45,-3.2);
+  addRoad(70, 0);
+  trackLen = segments.length * SEG_LEN;
+}
+function seg(z){ return segments[Math.floor(z/SEG_LEN) % segments.length]; }
+
+const CAR_PALETTE = ['#3d4a6b','#54426b','#2f4a58','#4a3d5e','#39435c'];
+function spawnTraffic(count){
+  traffic = [];
+  for(let i=0;i<count;i++){
+    traffic.push({
+      z: ((i+1)/(count+1))*trackLen,
+      x: (Math.floor(Math.random()*LANES) - 1) * 0.62,
+      spd: MAX_SPEED * (0.28 + Math.random()*0.22),
+      col: CAR_PALETTE[i%CAR_PALETTE.length],
+      w: 0.34
+    });
+  }
+}
+
+/* ---------- 入力 ---------- */
+function pointer(on, x){
+  if(!playing) return;
+  if(!on){ steer = 0; return; }
+  steer = (x < W/2) ? -1 : 1;
+}
+addEventListener('touchstart', e=>{ handleTap(); pointer(true, e.touches[0].clientX); }, {passive:false});
+addEventListener('touchmove',  e=>{ e.preventDefault(); pointer(true, e.touches[0].clientX); }, {passive:false});
+addEventListener('touchend',   e=>{ if(e.touches.length===0) pointer(false); }, {passive:false});
+addEventListener('mousedown',  e=>{ handleTap(); pointer(true, e.clientX); });
+addEventListener('mousemove',  e=>{ if(e.buttons) pointer(true, e.clientX); });
+addEventListener('mouseup',    ()=> pointer(false));
+addEventListener('keydown', e=>{
+  if(e.key==='ArrowLeft') steer=-1;
+  if(e.key==='ArrowRight') steer=1;
+  if(e.key===' '||e.key==='Enter') handleTap();
+});
+addEventListener('keyup', e=>{
+  if(e.key==='ArrowLeft'&&steer<0) steer=0;
+  if(e.key==='ArrowRight'&&steer>0) steer=0;
+});
+
+const overlay = document.getElementById('overlay');
+const hint = document.getElementById('hint');
+const scoreLine = document.getElementById('score-line');
+let canRestart = true;
+
+function handleTap(){
+  if(playing || !canRestart) return;
+  initAudio();
+  if(actx && actx.state==='suspended') actx.resume();
+  startGame();
+}
+function startGame(){
+  buildTrack();
+  spawnTraffic(14);
+  pos=0; playerX=0; speed=0; distKm=0; dead=false; shake=0; steer=0; bgShift=0;
+  playing = true;
+  overlay.classList.add('hidden');
+  hint.classList.remove('hidden');
+  setTimeout(()=>hint.classList.add('hidden'), 3500);
+  playStart();
+}
+function gameOver(){
+  playing=false; dead=true; canRestart=false;
+  isOffroad=false; setOffroad(false);
+  updateEngine(0,false);
+  playCrash();
+  shake = 7;
+  best = Math.max(best, distKm);
+  document.getElementById('ttl').textContent = '— 終 点 —';
+  document.getElementById('big').innerHTML = 'GAME <em>OVER</em>';
+  document.getElementById('sub').style.display='none';
+  scoreLine.style.display='block';
+  scoreLine.innerHTML = `走行距離 <b>${distKm.toFixed(1)} km</b>　／　ベスト <b>${best.toFixed(1)} km</b>`;
+  document.getElementById('tap').textContent='タップしてリトライ';
+  setTimeout(()=>{ overlay.classList.remove('hidden'); canRestart=true; }, 900);
+}
+
+/* ---------- 更新 ---------- */
+function update(dt){
+  globalT += dt;
+  if(!playing){
+    shake *= 0.92;
+    return;
+  }
+
+  const s = seg(pos + SEG_LEN*2);
+  speed = Math.min(speed + ACCEL*dt, MAX_SPEED);
+
+  const spdRatio = speed / MAX_SPEED;
+  playerX += steer * STEER * dt * spdRatio;
+  playerX -= s.curve * CENTRIFUGAL * dt * spdRatio * spdRatio;
+
+  const off = Math.abs(playerX) > 0.92;
+  if(off){
+    speed *= OFFROAD_DEC;
+    shake = Math.min(shake+dt*12, 4);
+  }else{
+    shake *= 0.85;
+  }
+  if(off !== isOffroad){ isOffroad = off; setOffroad(off); }
+  playerX = Math.max(-1.35, Math.min(1.35, playerX));
+
+  pos = (pos + speed*dt) % trackLen;
+  distKm += (speed*dt) / 18000;
+  bgShift -= s.curve * spdRatio * dt * 60;
+
+  updateEngine(spdRatio, true);
+
+  for(const c of traffic){
+    c.z = (c.z + c.spd*dt) % trackLen;
+    let dz = c.z - pos;
+    if(dz < -trackLen/2) dz += trackLen;
+    if(dz > trackLen/2)  dz -= trackLen;
+    if(dz > 0 && dz < SEG_LEN*1.1){
+      if(Math.abs(c.x - playerX) < c.w + 0.26){
+        gameOver();
+        return;
+      }
+    }
+  }
+
+  document.getElementById('spd').textContent = Math.round(speed/32);
+  document.getElementById('dist').textContent = distKm.toFixed(1);
+}
+
+/* ====================================================
+   描画
+==================================================== */
+function project(worldX, worldZ, camX){
+  const dz = Math.max(worldZ, 1);
+  const scale = CAM_H / dz;
+  return {
+    x: W/2 + scale * (worldX - camX) * (W/2) / ROAD_W * 1.9,
+    y: H*0.55 + scale * CAM_H * (H/2) / ROAD_W * 0.62,
+    w: scale * ROAD_W * (W/2) / ROAD_W * 1.9,
+    scale
+  };
+}
+
+function wrapMod(v, m){ return ((v % m) + m) % m; }
+
+function drawBackdrop(){
+  const horizon = H*0.55;
+
+  // 空
+  const sky = ctx.createLinearGradient(0,0,0,horizon);
+  sky.addColorStop(0,'#04060b');
+  sky.addColorStop(0.55,'#0c1019');
+  sky.addColorStop(0.88,'#181f30');
+  sky.addColorStop(1,'#232c42');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0,0,W,horizon);
+
+  // 星(瞬き)
+  for(const st of stars){
+    const a = 0.25 + 0.55 * (0.5 + 0.5*Math.sin(globalT*st.sp + st.tw));
+    ctx.fillStyle = `rgba(200,210,235,${a})`;
+    ctx.fillRect(st.x, st.y, st.r, st.r);
+  }
+
+  // 月(三日月+ほのかな暈)
+  const mx = W*0.76, my = H*0.14, mr = Math.min(W,H)*0.045;
+  const halo = ctx.createRadialGradient(mx,my,mr*0.4, mx,my,mr*4);
+  halo.addColorStop(0,'rgba(220,228,245,0.10)');
+  halo.addColorStop(1,'rgba(220,228,245,0)');
+  ctx.fillStyle = halo;
+  ctx.fillRect(mx-mr*4,my-mr*4,mr*8,mr*8);
+  ctx.fillStyle = '#dfe5f2';
+  ctx.beginPath(); ctx.arc(mx,my,mr,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#0c1019';
+  ctx.beginPath(); ctx.arc(mx-mr*0.42,my-mr*0.18,mr*0.92,0,Math.PI*2); ctx.fill();
+
+  // 遠い山並み(パララックス小)
+  const rShift = wrapMod(bgShift*0.12, W*2);
+  ctx.fillStyle = '#0e1320';
+  ctx.beginPath();
+  ctx.moveTo(-10, horizon);
+  for(let rep=-1;rep<=1;rep++){
+    for(const r of ridge){
+      const px = r.x - rShift + rep*W*2;
+      if(px < -120 || px > W+120) continue;
+      ctx.lineTo(px, horizon - r.h);
+    }
+  }
+  ctx.lineTo(W+10, horizon);
+  ctx.closePath(); ctx.fill();
+
+  // 街のシルエット(パララックス中)
+  const sShift = wrapMod(bgShift*0.3, W*2);
+  for(let rep=-1;rep<=1;rep++){
+    for(const b of skyline){
+      const px = b.x - sShift + rep*W*2;
+      if(px+b.w < -10 || px > W+10) continue;
+      ctx.fillStyle = '#0a0d15';
+      ctx.fillRect(px, horizon-b.h, b.w, b.h);
+      // 窓灯り(琥珀)
+      ctx.fillStyle = 'rgba(242,163,60,0.55)';
+      for(const wn of b.win){
+        ctx.fillRect(px+wn.dx, horizon-b.h+wn.dy, 2.4, 2.8);
+      }
+    }
+  }
+
+  // 地平の靄(街の照り返し)
+  const glow = ctx.createLinearGradient(0,horizon-H*0.07,0,horizon+H*0.02);
+  glow.addColorStop(0,'rgba(242,163,60,0)');
+  glow.addColorStop(0.8,'rgba(242,163,60,0.085)');
+  glow.addColorStop(1,'rgba(242,163,60,0.02)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(0,horizon-H*0.07,W,H*0.09);
+
+  // 地面
+  const gnd = ctx.createLinearGradient(0,horizon,0,H);
+  gnd.addColorStop(0,'#11151f');
+  gnd.addColorStop(1,'#0a0d14');
+  ctx.fillStyle = gnd;
+  ctx.fillRect(0,horizon,W,H-horizon);
+}
+
+function render(){
+  drawBackdrop();
+
+  const sx = (Math.random()-0.5)*shake*2;
+  const sy = (Math.random()-0.5)*shake;
+
+  const baseSeg = Math.floor(pos/SEG_LEN);
+  let x=0, dx=0;
+  const camX = playerX * ROAD_W;
+  let maxY = H;
+  const polys = [];
+  const poles = [];
+
+  for(let n=0;n<DRAW_SEGS;n++){
+    const i = (baseSeg + n) % segments.length;
+    const sgm = segments[i];
+    const zNear = n*SEG_LEN - (pos % SEG_LEN);
+    const zFar  = zNear + SEG_LEN;
+    if(zFar < 1) { x += dx; dx += sgm.curve; continue; }
+
+    const p1 = project(x, zNear + 1, camX);
+    const p2 = project(x + dx, zFar + 1, camX);
+    x += dx; dx += sgm.curve;
+
+    if(p1.y <= maxY){
+      const dark = Math.floor((baseSeg+n)/RUMBLE)%2===0;
+      const fog = Math.min(n/DRAW_SEGS*1.15, 1);
+      polys.push({p1,p2,dark,fog});
+      // 街灯(左右交互、7セグメントごと)
+      if(i % 7 === 0){
+        const side = (Math.floor(i/7)%2===0)? -1 : 1;
+        poles.push({ x: p1.x + side*p1.w*1.18, y: p1.y, s: p1.scale, fog, side });
+      }
+      maxY = p1.y;
+    }
+  }
+
+  /* 路面(奥から手前) */
+  for(let k=polys.length-1;k>=0;k--){
+    const {p1,p2,dark,fog} = polys[k];
+    // アスファルト(ヘッドライトの照りを中央に)
+    ctx.fillStyle = dark ? '#12161f' : '#151a27';
+    quad(p1.x-p1.w+sx, p1.y+sy, p1.x+p1.w+sx, p2.x-p2.w+sx, p2.y+sy, p2.x+p2.w+sx);
+    // 路肩ライン
+    const ew = 0.04;
+    ctx.fillStyle = `rgba(205,212,228,${0.55*(1-fog)})`;
+    quad(p1.x-p1.w+sx, p1.y+sy, p1.x-p1.w*(1-ew)+sx, p2.x-p2.w+sx, p2.y+sy, p2.x-p2.w*(1-ew)+sx);
+    quad(p1.x+p1.w*(1-ew)+sx, p1.y+sy, p1.x+p1.w+sx, p2.x+p2.w*(1-ew)+sx, p2.y+sy, p2.x+p2.w+sx);
+    // 車線(破線)
+    if(dark){
+      ctx.fillStyle = `rgba(120,132,160,${0.5*(1-fog)})`;
+      for(const lane of [-1/3, 1/3]){
+        const lw = 0.012;
+        quad(
+          p1.x + p1.w*lane*2 - p1.w*lw + sx, p1.y + sy,
+          p1.x + p1.w*lane*2 + p1.w*lw + sx,
+          p2.x + p2.w*lane*2 - p2.w*lw + sx, p2.y + sy,
+          p2.x + p2.w*lane*2 + p2.w*lw + sx
+        );
+      }
+    }
+  }
+
+  /* 自車ヘッドライトの路面照らし */
+  const hlY = H*0.86;
+  const hl = ctx.createRadialGradient(W/2+sx, hlY-H*0.16, 10, W/2+sx, hlY-H*0.16, H*0.30);
+  hl.addColorStop(0,'rgba(245,238,215,0.10)');
+  hl.addColorStop(0.5,'rgba(245,238,215,0.045)');
+  hl.addColorStop(1,'rgba(245,238,215,0)');
+  ctx.fillStyle = hl;
+  ctx.beginPath();
+  ctx.moveTo(W/2 - 36 + sx, hlY);
+  ctx.lineTo(W/2 - W*0.20 + sx, hlY - H*0.30);
+  ctx.lineTo(W/2 + W*0.20 + sx, hlY - H*0.30);
+  ctx.lineTo(W/2 + 36 + sx, hlY);
+  ctx.closePath(); ctx.fill();
+
+  /* 街灯(奥から) */
+  for(let k=poles.length-1;k>=0;k--){
+    const p = poles[k];
+    drawPole(p.x+sx, p.y+sy, p.s, p.fog, p.side);
+  }
+
+  /* 交通車両 */
+  const drawList = [];
+  for(const c of traffic){
+    let dz = c.z - pos;
+    if(dz < -trackLen/2) dz += trackLen;
+    if(dz > trackLen/2)  dz -= trackLen;
+    if(dz < 2 || dz > DRAW_SEGS*SEG_LEN) continue;
+    let cx=0, cdx=0;
+    const steps = Math.floor(dz/SEG_LEN);
+    for(let n=0;n<steps;n++){
+      cx += cdx; cdx += segments[(baseSeg+n)%segments.length].curve;
+    }
+    const p = project(cx + c.x*ROAD_W, dz, camX);
+    drawList.push({p, c, dz});
+  }
+  drawList.sort((a,b)=>b.dz-a.dz);
+  for(const {p,c,dz} of drawList){
+    const cw = p.w * c.w;
+    const ch = cw * 0.78;
+    const fog = Math.min(dz/(DRAW_SEGS*SEG_LEN)*1.2, 0.85);
+    drawCar(p.x+sx, p.y+sy, cw, ch, c.col, fog);
+  }
+
+  /* スピード演出:左右の流線 */
+  const spdRatio = speed/MAX_SPEED;
+  if(playing && spdRatio > 0.55){
+    const a = (spdRatio-0.55)/0.45 * 0.16;
+    ctx.strokeStyle = `rgba(200,210,235,${a})`;
+    ctx.lineWidth = 1;
+    for(let i=0;i<6;i++){
+      const yy = H*0.30 + ((globalT*900*spdRatio + i*140) % (H*0.55));
+      const len = 30 + spdRatio*70;
+      const ex = i%2===0 ? W*0.06 : W*0.94;
+      const lean2 = i%2===0 ? -1 : 1;
+      ctx.beginPath();
+      ctx.moveTo(ex, yy);
+      ctx.lineTo(ex + lean2*8, yy+len);
+      ctx.stroke();
+    }
+  }
+
+  /* 自車 */
+  if(playing || dead){
+    drawPlayer(W/2 + sx, hlY + sy);
+  }
+
+  /* ビネット */
+  const vg = ctx.createRadialGradient(W/2,H*0.5,Math.min(W,H)*0.45, W/2,H*0.5,Math.max(W,H)*0.78);
+  vg.addColorStop(0,'rgba(0,0,0,0)');
+  vg.addColorStop(1,'rgba(0,0,0,0.42)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(0,0,W,H);
+}
+
+function quad(x1,y1,x2, x3,y3,x4){
+  ctx.beginPath();
+  ctx.moveTo(x1,y1); ctx.lineTo(x2,y1);
+  ctx.lineTo(x4,y3); ctx.lineTo(x3,y3);
+  ctx.closePath(); ctx.fill();
+}
+
+/* 街灯:細い支柱と琥珀の灯、路面への光だまり */
+function drawPole(x, y, scale, fog, side){
+  const h = scale * 300;
+  if(h < 3) return;
+  const alpha = (1-fog);
+  // 光だまり
+  const pool = ctx.createRadialGradient(x - side*h*0.18, y, 1, x - side*h*0.18, y, h*0.55);
+  pool.addColorStop(0,`rgba(242,163,60,${0.10*alpha})`);
+  pool.addColorStop(1,'rgba(242,163,60,0)');
+  ctx.fillStyle = pool;
+  ctx.beginPath();
+  ctx.ellipse(x - side*h*0.18, y, h*0.55, h*0.16, 0, 0, Math.PI*2);
+  ctx.fill();
+  // 支柱
+  ctx.strokeStyle = `rgba(40,48,66,${alpha})`;
+  ctx.lineWidth = Math.max(1, h*0.022);
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x, y-h);
+  ctx.lineTo(x - side*h*0.18, y-h);
+  ctx.stroke();
+  // 灯
+  ctx.fillStyle = `rgba(242,163,60,${0.9*alpha})`;
+  ctx.shadowColor = '#f2a33c';
+  ctx.shadowBlur = h*0.12;
+  ctx.beginPath();
+  ctx.arc(x - side*h*0.18, y-h, Math.max(1.2, h*0.03), 0, Math.PI*2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+}
+
+/* 前方車:立体感のあるボディ+テールランプと路面反射 */
+function drawCar(x, y, w, h, col, fog){
+  ctx.save();
+  ctx.globalAlpha = 1 - fog;
+  // テールランプの路面反射
+  const refl = ctx.createLinearGradient(0, y, 0, y + h*1.6);
+  refl.addColorStop(0,'rgba(242,163,60,0.20)');
+  refl.addColorStop(1,'rgba(242,163,60,0)');
+  ctx.fillStyle = refl;
+  ctx.fillRect(x-w*0.85, y, w*0.4, h*1.6);
+  ctx.fillRect(x+w*0.45, y, w*0.4, h*1.6);
+  // 影
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.beginPath();
+  ctx.ellipse(x, y, w*1.1, h*0.2, 0, 0, Math.PI*2);
+  ctx.fill();
+  // ボディ(縦グラデーション)
+  const body = ctx.createLinearGradient(0, y-h, 0, y);
+  body.addColorStop(0, lighten(col, 18));
+  body.addColorStop(1, col);
+  ctx.fillStyle = body;
+  roundRect(x-w, y-h, w*2, h, w*0.22);
+  // リアウィンドウ
+  ctx.fillStyle = 'rgba(8,11,18,0.7)';
+  roundRect(x-w*0.62, y-h*0.96, w*1.24, h*0.42, w*0.16);
+  // バンパーライン
+  ctx.fillStyle = 'rgba(0,0,0,0.3)';
+  ctx.fillRect(x-w*0.95, y-h*0.18, w*1.9, h*0.06);
+  // テールランプ
+  ctx.fillStyle = '#f2a33c';
+  ctx.shadowColor = '#f2a33c';
+  ctx.shadowBlur = w*0.6;
+  roundRect(x-w*0.82, y-h*0.42, w*0.34, h*0.14, 2);
+  roundRect(x+w*0.48, y-h*0.42, w*0.34, h*0.14, 2);
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+function lighten(hex, amt){
+  const n = parseInt(hex.slice(1),16);
+  const r = Math.min(255,(n>>16)+amt), g = Math.min(255,((n>>8)&255)+amt), b = Math.min(255,(n&255)+amt);
+  return `rgb(${r},${g},${b})`;
+}
+
+/* 自車 */
+function drawPlayer(x, y){
+  const w = Math.min(W*0.13, 64), h = w*0.62;
+  const lean = steer * w*0.10;
+  ctx.save();
+  ctx.translate(x, y);
+  // テールランプの路面反射
+  const refl = ctx.createLinearGradient(0, 0, 0, h*1.4);
+  refl.addColorStop(0,'rgba(242,163,60,0.22)');
+  refl.addColorStop(1,'rgba(242,163,60,0)');
+  ctx.fillStyle = refl;
+  ctx.fillRect(-w*0.7+lean, -h*0.1, w*1.4, h*1.5);
+  // 影
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.beginPath();
+  ctx.ellipse(0, h*0.55, w*1.25, h*0.3, 0, 0, Math.PI*2);
+  ctx.fill();
+  // ボディ
+  const body = ctx.createLinearGradient(0,-h,0,h*0.4);
+  body.addColorStop(0,'#f4f6fa');
+  body.addColorStop(0.6,'#dfe3ec');
+  body.addColorStop(1,'#b9c0d0');
+  ctx.fillStyle = body;
+  ctx.beginPath();
+  ctx.moveTo(-w + lean, 0);
+  ctx.lineTo(-w*0.78 + lean*0.5, -h);
+  ctx.lineTo( w*0.78 + lean*0.5, -h);
+  ctx.lineTo( w + lean, 0);
+  ctx.quadraticCurveTo(0, h*0.42, -w + lean, 0);
+  ctx.fill();
+  // キャビン
+  ctx.fillStyle = '#10141f';
+  ctx.beginPath();
+  ctx.moveTo(-w*0.55 + lean*0.5, -h*0.92);
+  ctx.lineTo(-w*0.40 + lean*0.3, -h*0.45);
+  ctx.lineTo( w*0.40 + lean*0.3, -h*0.45);
+  ctx.lineTo( w*0.55 + lean*0.5, -h*0.92);
+  ctx.closePath(); ctx.fill();
+  // テールランプ(琥珀の一本線)
+  ctx.fillStyle = '#f2a33c';
+  ctx.shadowColor = '#f2a33c';
+  ctx.shadowBlur = 16;
+  ctx.fillRect(-w*0.7 + lean, -h*0.30, w*1.4, h*0.10);
+  ctx.restore();
+}
+
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath(); ctx.fill();
+}
+
+/* ---------- メインループ ---------- */
+function loop(t){
+  const dt = Math.min((t - lastTime)/1000, 0.05);
+  lastTime = t;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+buildTrack();
+spawnTraffic(14);
+requestAnimationFrame(t=>{ lastTime=t; requestAnimationFrame(loop); });
+})();
+</script>
+</body>
+</html>
