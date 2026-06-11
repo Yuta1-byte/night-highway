@@ -53,6 +53,32 @@
     text-shadow:0 1px 4px rgba(0,0,0,.8)}
   #hint.hidden{opacity:0}
 
+  /* 耐久ゲージ */
+  #hp{position:absolute;bottom:max(30px,env(safe-area-inset-bottom));left:50%;
+    transform:translateX(-50%);width:128px;text-align:center;pointer-events:none;
+    transition:opacity .4s}
+  #hp.hidden{opacity:0}
+  #hp .hp-label{font-size:9px;letter-spacing:.32em;color:#525c72;margin-bottom:6px;
+    transition:color .3s}
+  #hp.drain .hp-label{color:var(--amber)}
+  #hpbar{height:2px;background:rgba(200,206,219,.14);border-radius:1px;overflow:hidden}
+  #hpfill{display:block;height:100%;width:100%;background:#8a93a8;
+    transform-origin:left;transition:transform .15s linear, background .3s}
+  #hpfill.low{background:var(--amber)}
+
+  /* 速度上限アップの通知 */
+  #lvl{position:absolute;top:max(68px,calc(env(safe-area-inset-top) + 56px));
+    left:50%;transform:translateX(-50%);
+    font-size:11px;letter-spacing:.35em;color:var(--amber);
+    opacity:0;pointer-events:none;text-shadow:0 0 12px rgba(242,163,60,.5)}
+  #lvl.show{animation:lvlpop 2.2s ease-out}
+  @keyframes lvlpop{
+    0%{opacity:0;transform:translate(-50%,8px)}
+    15%{opacity:1;transform:translate(-50%,0)}
+    70%{opacity:1}
+    100%{opacity:0;transform:translate(-50%,-4px)}
+  }
+
   /* サウンド切替 */
   #snd{position:absolute;top:max(14px,env(safe-area-inset-top));left:50%;
     transform:translateX(-50%);
@@ -78,6 +104,13 @@
   </div>
 
   <button id="snd">SOUND ON</button>
+
+  <div id="lvl">MAX SPEED +20</div>
+
+  <div id="hp" class="hidden">
+    <div class="hp-label">INTEGRITY</div>
+    <div id="hpbar"><i id="hpfill"></i></div>
+  </div>
 
   <div id="hint" class="hidden">
     <span>◀ 左をタッチ</span><span>右をタッチ ▶</span>
@@ -166,12 +199,13 @@ function buildEngineSound(){
 function updateEngine(spdRatio, on){
   if(!engine) return;
   const t = actx.currentTime;
-  const f = 38 + spdRatio*82;
+  const f = 38 + spdRatio*82;                 // 周波数は絶対速度に比例(上限なし)
+  const gr = Math.min(spdRatio, 1.25);        // 音量・フィルターは頭打ち
   engine.osc1.frequency.setTargetAtTime(f, t, 0.08);
   engine.osc2.frequency.setTargetAtTime(f*1.5, t, 0.08);
-  engine.lp.frequency.setTargetAtTime(220 + spdRatio*700, t, 0.1);
-  engine.g.gain.setTargetAtTime(on ? 0.035 + spdRatio*0.045 : 0, t, 0.15);
-  engine.ng.gain.setTargetAtTime(on ? spdRatio*0.018 : 0, t, 0.15);
+  engine.lp.frequency.setTargetAtTime(220 + gr*700, t, 0.1);
+  engine.g.gain.setTargetAtTime(on ? 0.035 + gr*0.045 : 0, t, 0.15);
+  engine.ng.gain.setTargetAtTime(on ? gr*0.018 : 0, t, 0.15);
 }
 
 /* ---- 路肩走行ノイズ ---- */
@@ -219,6 +253,38 @@ function playCrash(){
   musicBus.gain.linearRampToValueAtTime(0.9, t+2.4);
 }
 
+/* ---- 損耗による停止音(静かに息絶える) ---- */
+function playBreakdown(){
+  if(!actx) return;
+  const t = actx.currentTime;
+  // スパッタ(息継ぎするようなノイズ)
+  for(let i=0;i<4;i++){
+    const n = actx.createBufferSource(); n.buffer = makeNoiseBuffer(0.12);
+    const bp = actx.createBiquadFilter(); bp.type='bandpass';
+    bp.frequency.value = 520 - i*95;
+    const g = actx.createGain();
+    const st = t + i*0.17;
+    g.gain.setValueAtTime(0.20, st);
+    g.gain.exponentialRampToValueAtTime(0.001, st+0.13);
+    n.connect(bp); bp.connect(g); g.connect(sfxBus);
+    n.start(st); n.stop(st+0.14);
+  }
+  // 下降していくトーン
+  const o = actx.createOscillator(); o.type='triangle';
+  o.frequency.setValueAtTime(150, t);
+  o.frequency.exponentialRampToValueAtTime(30, t+1.2);
+  const og = actx.createGain();
+  og.gain.setValueAtTime(0.16, t);
+  og.gain.exponentialRampToValueAtTime(0.001, t+1.3);
+  o.connect(og); og.connect(sfxBus);
+  o.start(t); o.stop(t+1.35);
+  // BGMを一瞬沈める
+  musicBus.gain.cancelScheduledValues(t);
+  musicBus.gain.setValueAtTime(musicBus.gain.value, t);
+  musicBus.gain.linearRampToValueAtTime(0.25, t+0.2);
+  musicBus.gain.linearRampToValueAtTime(0.9, t+2.6);
+}
+
 /* ---- スタート音 ---- */
 function playStart(){
   if(!actx) return;
@@ -257,16 +323,19 @@ function scheduleStep(s, t){
   playBass(chord.root + ((inBar===2||inBar===6)?12:0), t);
   // アルペジオ:控えめなプラック
   playPluck(chord.tones[ARP_PAT[inBar]] + 12, t, inBar);
-  // ハット:裏拍
-  if(inBar%2===1) playHat(t);
+  // ハット:裏拍(30km以降は表にも小さなゴーストが入り、密度がわずかに上がる)
+  if(inBar%2===1) playHat(t, 0.014);
+  else if(stage >= 3) playHat(t, 0.007);
 }
 function playPad(chord, t, dur){
+  // 熱を帯びるほどフィルターが開き、こもった音が艶を帯びる
+  const cutoff = 620 + heatVis*1500;
   chord.tones.forEach(m=>{
     [-6,6].forEach(det=>{
       const o = actx.createOscillator(); o.type='sawtooth';
       o.frequency.value = m2f(m); o.detune.value = det;
       const lp = actx.createBiquadFilter(); lp.type='lowpass';
-      lp.frequency.value = 620; lp.Q.value = 0.4;
+      lp.frequency.value = cutoff; lp.Q.value = 0.4;
       const g = actx.createGain();
       g.gain.setValueAtTime(0.0001, t);
       g.gain.linearRampToValueAtTime(0.022, t+dur*0.3);
@@ -299,11 +368,11 @@ function playPluck(m, t, inBar){
   else { o.connect(g); g.connect(musicBus); }
   o.start(t); o.stop(t+0.4);
 }
-function playHat(t){
+function playHat(t, vol){
   const n = actx.createBufferSource(); n.buffer = makeNoiseBuffer(0.06);
   const hp = actx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=7000;
   const g = actx.createGain();
-  g.gain.setValueAtTime(0.014,t);
+  g.gain.setValueAtTime(vol || 0.014, t);
   g.gain.exponentialRampToValueAtTime(0.0005, t+0.05);
   n.connect(hp); hp.connect(g); g.connect(musicBus);
   n.start(t); n.stop(t+0.06);
@@ -394,6 +463,13 @@ let steer = 0;
 let traffic = [];
 let lastTime = 0;
 let shake = 0;
+let visLean = 0;          // 車体ロール(滑らかに追従)
+let hp = 1;               // 耐久(道路外で合計10秒消耗)
+let particles = [];       // 破損エフェクト粒子
+let deathT = 0;           // 破損からの経過時間
+let stage = 0;            // 10kmごとに+1
+let curMax = MAX_SPEED;   // 現在の上限速度(10kmごとに+20km/h)
+let heatVis = 0;          // 車体の熱色(0=白 → 1=琥珀、滑らかに変化)
 let best = 0;
 let bgShift = 0;          // 背景パララックス
 let isOffroad = false;
@@ -470,30 +546,147 @@ function handleTap(){
   if(actx && actx.state==='suspended') actx.resume();
   startGame();
 }
+const hpEl = document.getElementById('hp');
+const hpFill = document.getElementById('hpfill');
+
 function startGame(){
   buildTrack();
   spawnTraffic(14);
   pos=0; playerX=0; speed=0; distKm=0; dead=false; shake=0; steer=0; bgShift=0;
+  hp=1; particles=[]; deathT=0;
+  stage=0; curMax=MAX_SPEED; heatVis=0;
+  hpFill.style.transform='scaleX(1)';
+  hpFill.classList.remove('low');
+  hpEl.classList.remove('drain');
+  hpEl.classList.remove('hidden');
   playing = true;
   overlay.classList.add('hidden');
   hint.classList.remove('hidden');
   setTimeout(()=>hint.classList.add('hidden'), 3500);
   playStart();
 }
-function gameOver(){
+function gameOver(cause){
   playing=false; dead=true; canRestart=false;
   isOffroad=false; setOffroad(false);
   updateEngine(0,false);
-  playCrash();
-  shake = 7;
+  deathT=0;
+  spawnBreak();
+  if(cause==='wear'){ playBreakdown(); shake=4; }
+  else { playCrash(); shake=7; }
+  hpEl.classList.add('hidden');
   best = Math.max(best, distKm);
   document.getElementById('ttl').textContent = '— 終 点 —';
   document.getElementById('big').innerHTML = 'GAME <em>OVER</em>';
-  document.getElementById('sub').style.display='none';
+  const subEl = document.getElementById('sub');
+  subEl.style.display='block';
+  subEl.textContent = (cause==='wear')
+    ? '車体の損耗により、走行不能'
+    : '前走車との接触により、走行不能';
   scoreLine.style.display='block';
   scoreLine.innerHTML = `走行距離 <b>${distKm.toFixed(1)} km</b>　／　ベスト <b>${best.toFixed(1)} km</b>`;
   document.getElementById('tap').textContent='タップしてリトライ';
-  setTimeout(()=>{ overlay.classList.remove('hidden'); canRestart=true; }, 900);
+  setTimeout(()=>{ overlay.classList.remove('hidden'); canRestart=true; }, 1500);
+}
+
+/* ---------- 10kmごとの速度上限アップ ---------- */
+const lvlEl = document.getElementById('lvl');
+function stageUp(){
+  curMax = MAX_SPEED + stage * 640;     // 表示速度で+20km/h(640内部単位)
+  // 通知
+  lvlEl.classList.remove('show');
+  void lvlEl.offsetWidth;               // アニメーション再発火
+  lvlEl.classList.add('show');
+  // 車体から琥珀の火の粉がふわりと立ちのぼる
+  const px = W/2, py = H*0.86;
+  for(let i=0;i<22;i++){
+    const a = -Math.PI/2 + (Math.random()-0.5)*2.4;
+    const sp = 30 + Math.random()*110;
+    particles.push({
+      type:'ember',
+      x: px + (Math.random()-0.5)*70,
+      y: py - 14 + (Math.random()-0.5)*16,
+      vx: Math.cos(a)*sp, vy: Math.sin(a)*sp - 40,
+      life: 0.8 + Math.random()*1.0, t:0,
+      size: 1 + Math.random()*1.8
+    });
+  }
+  playStageUp();
+}
+function playStageUp(){
+  if(!actx) return;
+  const t = actx.currentTime;
+  // 柔らかい鐘のような二音(上昇)
+  [659.3, 987.8].forEach((f,i)=>{
+    const o = actx.createOscillator(); o.type='sine'; o.frequency.value=f;
+    const g = actx.createGain();
+    const st = t + i*0.12;
+    g.gain.setValueAtTime(0.0001, st);
+    g.gain.exponentialRampToValueAtTime(0.09, st+0.02);
+    g.gain.exponentialRampToValueAtTime(0.001, st+0.55);
+    o.connect(g); g.connect(sfxBus);
+    o.start(st); o.stop(st+0.6);
+  });
+}
+
+/* ---------- 破損エフェクト ---------- */
+function spawnBreak(){
+  const px = W/2, py = H*0.86;
+  // 琥珀の火の粉
+  for(let i=0;i<46;i++){
+    const a = Math.random()*Math.PI*2;
+    const sp = 40 + Math.random()*230;
+    particles.push({
+      type:'ember',
+      x: px + (Math.random()-0.5)*44,
+      y: py - 18 + (Math.random()-0.5)*18,
+      vx: Math.cos(a)*sp, vy: Math.sin(a)*sp - 90,
+      life: 0.9 + Math.random()*1.4, t:0,
+      size: 1 + Math.random()*2.2
+    });
+  }
+  // 車体の破片(淡い色のかけら)
+  for(let i=0;i<14;i++){
+    const a = -Math.PI/2 + (Math.random()-0.5)*1.7;
+    const sp = 130 + Math.random()*270;
+    particles.push({
+      type:'shard',
+      x: px + (Math.random()-0.5)*52, y: py - 24,
+      vx: Math.cos(a)*sp, vy: Math.sin(a)*sp,
+      rot: Math.random()*Math.PI, vr: (Math.random()-0.5)*9,
+      life: 1.4 + Math.random()*0.9, t:0,
+      size: 3 + Math.random()*7
+    });
+  }
+}
+function updateParticles(dt){
+  if(dead) deathT += dt;
+  for(const p of particles){
+    p.t += dt;
+    p.vy += (p.type==='shard' ? 640 : 190) * dt;   // 重力(火の粉は軽い)
+    p.vx *= (1 - 0.8*dt);
+    p.x += p.vx*dt; p.y += p.vy*dt;
+    if(p.type==='shard') p.rot += p.vr*dt;
+  }
+  particles = particles.filter(p => p.t < p.life);
+}
+function renderParticles(){
+  for(const p of particles){
+    const k = 1 - p.t/p.life;
+    if(p.type==='ember'){
+      ctx.fillStyle = `rgba(242,163,60,${0.85*k})`;
+      ctx.shadowColor = '#f2a33c';
+      ctx.shadowBlur = 6;
+      ctx.fillRect(p.x, p.y, p.size, p.size);
+      ctx.shadowBlur = 0;
+    }else{
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.fillStyle = `rgba(223,229,242,${0.8*k})`;
+      ctx.fillRect(-p.size/2, -p.size*0.3, p.size, p.size*0.6);
+      ctx.restore();
+    }
+  }
 }
 
 /* ---------- 更新 ---------- */
@@ -501,13 +694,15 @@ function update(dt){
   globalT += dt;
   if(!playing){
     shake *= 0.92;
+    visLean *= 0.9;
     return;
   }
 
   const s = seg(pos + SEG_LEN*2);
-  speed = Math.min(speed + ACCEL*dt, MAX_SPEED);
+  speed = Math.min(speed + ACCEL*dt, curMax);
 
-  const spdRatio = speed / MAX_SPEED;
+  const spdRatio = speed / curMax;
+  visLean += (steer - visLean) * Math.min(1, dt*7);
   playerX += steer * STEER * dt * spdRatio;
   playerX -= s.curve * CENTRIFUGAL * dt * spdRatio * spdRatio;
 
@@ -515,26 +710,53 @@ function update(dt){
   if(off){
     speed *= OFFROAD_DEC;
     shake = Math.min(shake+dt*12, 4);
+    hp -= dt/10;                       // 合計10秒で破損
+    hpEl.classList.add('drain');
+    // 路面との擦過で散る小さな火花
+    if(Math.random() < 0.6){
+      const side = playerX > 0 ? 1 : -1;
+      particles.push({
+        type:'ember',
+        x: W/2 + side*42 + (Math.random()-0.5)*14,
+        y: H*0.86 + (Math.random()-0.5)*10,
+        vx: -side*(30+Math.random()*90), vy: -(50+Math.random()*130),
+        life: 0.3 + Math.random()*0.4, t:0,
+        size: 1 + Math.random()*1.6
+      });
+    }
   }else{
     shake *= 0.85;
+    hpEl.classList.remove('drain');
   }
   if(off !== isOffroad){ isOffroad = off; setOffroad(off); }
   playerX = Math.max(-1.35, Math.min(1.35, playerX));
+
+  hpFill.style.transform = `scaleX(${Math.max(0,hp)})`;
+  hpFill.classList.toggle('low', hp < 0.4);
+  if(hp <= 0){
+    gameOver('wear');
+    return;
+  }
 
   pos = (pos + speed*dt) % trackLen;
   distKm += (speed*dt) / 18000;
   bgShift -= s.curve * spdRatio * dt * 60;
 
-  updateEngine(spdRatio, true);
+  // 10kmごとに上限速度+20km/h、車体は徐々に熱を帯びる
+  const ns = Math.floor(distKm / 10);
+  if(ns > stage){ stage = ns; stageUp(); }
+  heatVis += (Math.min(stage*0.18, 1) - heatVis) * Math.min(1, dt*1.2);
+
+  updateEngine(speed / MAX_SPEED, true);   // 絶対速度基準:ステージが進むほど唸りが高くなる
 
   for(const c of traffic){
     c.z = (c.z + c.spd*dt) % trackLen;
     let dz = c.z - pos;
     if(dz < -trackLen/2) dz += trackLen;
     if(dz > trackLen/2)  dz -= trackLen;
-    if(dz > 0 && dz < SEG_LEN*1.1){
-      if(Math.abs(c.x - playerX) < c.w + 0.26){
-        gameOver();
+    if(dz > 0 && dz < SEG_LEN*0.85){
+      if(Math.abs(c.x - playerX) < c.w + 0.13){
+        gameOver('hit');
         return;
       }
     }
@@ -745,7 +967,7 @@ function render(){
   }
 
   /* スピード演出:左右の流線 */
-  const spdRatio = speed/MAX_SPEED;
+  const spdRatio = speed/curMax;
   if(playing && spdRatio > 0.55){
     const a = (spdRatio-0.55)/0.45 * 0.16;
     ctx.strokeStyle = `rgba(200,210,235,${a})`;
@@ -766,6 +988,9 @@ function render(){
   if(playing || dead){
     drawPlayer(W/2 + sx, hlY + sy);
   }
+
+  /* 破損エフェクトと路肩火花 */
+  renderParticles();
 
   /* ビネット */
   const vg = ctx.createRadialGradient(W/2,H*0.5,Math.min(W,H)*0.45, W/2,H*0.5,Math.max(W,H)*0.78);
@@ -855,30 +1080,52 @@ function lighten(hex, amt){
   const r = Math.min(255,(n>>16)+amt), g = Math.min(255,((n>>8)&255)+amt), b = Math.min(255,(n&255)+amt);
   return `rgb(${r},${g},${b})`;
 }
+function mixHex(a, b, k){
+  const na = parseInt(a.slice(1),16), nb = parseInt(b.slice(1),16);
+  const r = Math.round((na>>16)     + (((nb>>16)     - (na>>16))     * k));
+  const g = Math.round(((na>>8)&255) + ((((nb>>8)&255) - ((na>>8)&255)) * k));
+  const bl= Math.round((na&255)      + (((nb&255)      - (na&255))      * k));
+  return `rgb(${r},${g},${bl})`;
+}
 
 /* 自車 */
 function drawPlayer(x, y){
   const w = Math.min(W*0.13, 64), h = w*0.62;
-  const lean = steer * w*0.10;
+  const lean = visLean * w*0.10;
+  // 破損後:テールランプは明滅しながら静かに消えていく
+  let tl = 1;
+  if(dead){
+    tl = Math.max(0, 1 - deathT*1.1) * (0.35 + 0.65*Math.abs(Math.sin(deathT*30)));
+  }
   ctx.save();
   ctx.translate(x, y);
-  // テールランプの路面反射
+  // テールランプの路面反射(路面側なので水平のまま)
   const refl = ctx.createLinearGradient(0, 0, 0, h*1.4);
-  refl.addColorStop(0,'rgba(242,163,60,0.22)');
+  refl.addColorStop(0,`rgba(242,163,60,${0.22*tl})`);
   refl.addColorStop(1,'rgba(242,163,60,0)');
   ctx.fillStyle = refl;
   ctx.fillRect(-w*0.7+lean, -h*0.1, w*1.4, h*1.5);
-  // 影
+  // 影(路面側なので水平のまま)
   ctx.fillStyle = 'rgba(0,0,0,0.55)';
   ctx.beginPath();
   ctx.ellipse(0, h*0.55, w*1.25, h*0.3, 0, 0, Math.PI*2);
   ctx.fill();
-  // ボディ
+  // ここから車体:ステア方向へロール(破損後はわずかに沈み、傾いで止まる)
+  ctx.rotate(visLean * 0.11 + (dead ? Math.min(deathT*0.06, 0.05) : 0));
+  if(dead){
+    ctx.translate(0, Math.min(deathT*5, 3.5));
+    ctx.globalAlpha = Math.max(0.78, 1 - deathT*0.12);
+  }
+  // ボディ(走るほど熱を帯び、白から琥珀へ)
   const body = ctx.createLinearGradient(0,-h,0,h*0.4);
-  body.addColorStop(0,'#f4f6fa');
-  body.addColorStop(0.6,'#dfe3ec');
-  body.addColorStop(1,'#b9c0d0');
+  body.addColorStop(0,   mixHex('#f4f6fa', '#ffc97e', heatVis));
+  body.addColorStop(0.6, mixHex('#dfe3ec', '#f2a33c', heatVis));
+  body.addColorStop(1,   mixHex('#b9c0d0', '#c87f2a', heatVis));
   ctx.fillStyle = body;
+  if(heatVis > 0.05 && !dead){
+    ctx.shadowColor = '#f2a33c';
+    ctx.shadowBlur = 20 * heatVis;
+  }
   ctx.beginPath();
   ctx.moveTo(-w + lean, 0);
   ctx.lineTo(-w*0.78 + lean*0.5, -h);
@@ -886,6 +1133,7 @@ function drawPlayer(x, y){
   ctx.lineTo( w + lean, 0);
   ctx.quadraticCurveTo(0, h*0.42, -w + lean, 0);
   ctx.fill();
+  ctx.shadowBlur = 0;
   // キャビン
   ctx.fillStyle = '#10141f';
   ctx.beginPath();
@@ -894,10 +1142,10 @@ function drawPlayer(x, y){
   ctx.lineTo( w*0.40 + lean*0.3, -h*0.45);
   ctx.lineTo( w*0.55 + lean*0.5, -h*0.92);
   ctx.closePath(); ctx.fill();
-  // テールランプ(琥珀の一本線)
-  ctx.fillStyle = '#f2a33c';
+  // テールランプ(琥珀の一本線、破損後は明滅して消える)
+  ctx.fillStyle = `rgba(242,163,60,${tl})`;
   ctx.shadowColor = '#f2a33c';
-  ctx.shadowBlur = 16;
+  ctx.shadowBlur = 16*tl;
   ctx.fillRect(-w*0.7 + lean, -h*0.30, w*1.4, h*0.10);
   ctx.restore();
 }
@@ -917,6 +1165,7 @@ function loop(t){
   const dt = Math.min((t - lastTime)/1000, 0.05);
   lastTime = t;
   update(dt);
+  updateParticles(dt);
   render();
   requestAnimationFrame(loop);
 }
