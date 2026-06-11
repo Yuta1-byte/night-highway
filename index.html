@@ -166,6 +166,12 @@ function makeNoiseBuffer(sec){
 function initAudio(){
   if(actx) return;
   actx = new AC();
+  // iOSのアンロック:最初のジェスチャー内で無音を一度鳴らす
+  try{
+    const ub = actx.createBuffer(1, 1, 22050);
+    const us = actx.createBufferSource();
+    us.buffer = ub; us.connect(actx.destination); us.start(0);
+  }catch(e){}
   master = actx.createGain();
   master.gain.value = soundOn ? 1 : 0;
   master.connect(actx.destination);
@@ -304,7 +310,14 @@ function playStart(){
 function startSequencer(){
   step = 0;
   nextNoteTime = actx.currentTime + 0.1;
+  let wasRunning = (actx.state === 'running');
   seqTimer = setInterval(()=>{
+    // 起動完了までは予約せず待機し、走り出した瞬間に時刻を合わせ直す
+    if(actx.state !== 'running'){ wasRunning = false; return; }
+    if(!wasRunning){
+      wasRunning = true;
+      nextNoteTime = actx.currentTime + 0.1;
+    }
     while(nextNoteTime < actx.currentTime + 0.15){
       scheduleStep(step, nextNoteTime);
       step++;
@@ -470,6 +483,10 @@ let deathT = 0;           // 破損からの経過時間
 let stage = 0;            // 10kmごとに+1
 let curMax = MAX_SPEED;   // 現在の上限速度(10kmごとに+20km/h)
 let heatVis = 0;          // 車体の熱色(0=白 → 1=琥珀、滑らかに変化)
+const HARD_MAX = 14400;   // 上限速度の頭打ち(450km/h = 450×32)
+let meteors = [];         // 流星
+let nextMeteorKm = 55;    // 次の流星が流れる距離(55km以降、12kmごと)
+let dawnK = 0;            // 夜明けの兆し(100km到達から徐々に 0→1)
 let best = 0;
 let bgShift = 0;          // 背景パララックス
 let isOffroad = false;
@@ -543,8 +560,12 @@ let canRestart = true;
 function handleTap(){
   if(playing || !canRestart) return;
   initAudio();
-  if(actx && actx.state==='suspended') actx.resume();
-  startGame();
+  // 音声エンジンの起動完了を待ってから開始(初回の音欠け防止)
+  if(actx && actx.state === 'suspended'){
+    actx.resume().then(startGame).catch(startGame);
+  }else{
+    startGame();
+  }
 }
 const hpEl = document.getElementById('hp');
 const hpFill = document.getElementById('hpfill');
@@ -555,6 +576,7 @@ function startGame(){
   pos=0; playerX=0; speed=0; distKm=0; dead=false; shake=0; steer=0; bgShift=0;
   hp=1; particles=[]; deathT=0;
   stage=0; curMax=MAX_SPEED; heatVis=0;
+  meteors=[]; nextMeteorKm=55; dawnK=0;
   hpFill.style.transform='scaleX(1)';
   hpFill.classList.remove('low');
   hpEl.classList.remove('drain');
@@ -591,7 +613,9 @@ function gameOver(cause){
 /* ---------- 10kmごとの速度上限アップ ---------- */
 const lvlEl = document.getElementById('lvl');
 function stageUp(){
-  curMax = MAX_SPEED + stage * 640;     // 表示速度で+20km/h(640内部単位)
+  const next = Math.min(MAX_SPEED + stage * 640, HARD_MAX);  // 450km/hで頭打ち
+  if(next <= curMax) return;            // 既に上限なら通知も鳴らさない
+  curMax = next;
   // 通知
   lvlEl.classList.remove('show');
   void lvlEl.offsetWidth;               // アニメーション再発火
@@ -625,6 +649,87 @@ function playStageUp(){
     g.gain.exponentialRampToValueAtTime(0.001, st+0.55);
     o.connect(g); g.connect(sfxBus);
     o.start(st); o.stop(st+0.6);
+  });
+}
+
+/* ---------- 流星(55km以降、12kmごとに一つ) ---------- */
+function spawnMeteor(){
+  const dir = Math.random() < 0.5 ? 1 : -1;          // 流れる向き
+  const sp = 380 + Math.random()*220;
+  const ang = (0.32 + Math.random()*0.18) * Math.PI; // 浅い角度で落ちる
+  meteors.push({
+    x: W*(0.5 - dir*0.32) + (Math.random()-0.5)*W*0.2,
+    y: H*(0.04 + Math.random()*0.12),
+    vx: dir * Math.cos(ang*0.4) * sp,
+    vy: Math.sin(ang*0.4) * sp * 0.55,
+    t: 0, life: 1.3 + Math.random()*0.5
+  });
+  playMeteor();
+}
+function updateMeteors(dt){
+  for(const m of meteors){
+    m.t += dt;
+    m.x += m.vx*dt;
+    m.y += m.vy*dt;
+  }
+  meteors = meteors.filter(m => m.t < m.life);
+}
+function renderMeteors(){
+  for(const m of meteors){
+    // ふっと現れ、ふっと消える
+    const a = Math.min(m.t/0.18, 1) * Math.min((m.life-m.t)/0.45, 1);
+    const len = 110 + Math.abs(m.vx)*0.12;
+    const tx = m.x - (m.vx/(Math.hypot(m.vx,m.vy)||1))*len;
+    const ty = m.y - (m.vy/(Math.hypot(m.vx,m.vy)||1))*len;
+    // 尾
+    const tr = ctx.createLinearGradient(m.x, m.y, tx, ty);
+    tr.addColorStop(0, `rgba(235,240,255,${0.85*a})`);
+    tr.addColorStop(0.35, `rgba(190,205,245,${0.35*a})`);
+    tr.addColorStop(1, 'rgba(190,205,245,0)');
+    ctx.strokeStyle = tr;
+    ctx.lineWidth = 1.6;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(m.x, m.y);
+    ctx.lineTo(tx, ty);
+    ctx.stroke();
+    // 頭のきらめき
+    ctx.fillStyle = `rgba(245,248,255,${a})`;
+    ctx.shadowColor = '#dfe8ff';
+    ctx.shadowBlur = 10;
+    ctx.beginPath();
+    ctx.arc(m.x, m.y, 1.8, 0, Math.PI*2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+}
+/* 流星の音:高いきらめきと、尾を引いて下りていくグリッサンド */
+function playMeteor(){
+  if(!actx) return;
+  const t = actx.currentTime;
+  // きらめき(下降する三つの鐘)
+  [2093, 1661.2, 1318.5].forEach((f,i)=>{
+    const o = actx.createOscillator(); o.type='sine'; o.frequency.value=f;
+    const g = actx.createGain();
+    const st = t + i*0.09;
+    g.gain.setValueAtTime(0.0001, st);
+    g.gain.exponentialRampToValueAtTime(0.05, st+0.015);
+    g.gain.exponentialRampToValueAtTime(0.0008, st+0.7);
+    o.connect(g); g.connect(sfxBus);
+    o.start(st); o.stop(st+0.75);
+  });
+  // 尾(かすかに揺れながら下降するグリス)
+  [0, 5].forEach(det=>{
+    const o = actx.createOscillator(); o.type='sine';
+    o.detune.value = det;
+    o.frequency.setValueAtTime(1900, t);
+    o.frequency.exponentialRampToValueAtTime(620, t+1.4);
+    const g = actx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.022, t+0.12);
+    g.gain.exponentialRampToValueAtTime(0.0008, t+1.5);
+    o.connect(g); g.connect(sfxBus);
+    o.start(t); o.stop(t+1.55);
   });
 }
 
@@ -747,6 +852,14 @@ function update(dt){
   if(ns > stage){ stage = ns; stageUp(); }
   heatVis += (Math.min(stage*0.18, 1) - heatVis) * Math.min(1, dt*1.2);
 
+  // 55km以降、12kmごとに流星がひとつ流れる
+  if(distKm >= nextMeteorKm){
+    spawnMeteor();
+    nextMeteorKm += 12;
+  }
+  // 100km到達から、空に夜明けの兆しが差しはじめる(15kmかけて)
+  dawnK = Math.min(Math.max((distKm - 100) / 15, 0), 1);
+
   updateEngine(speed / MAX_SPEED, true);   // 絶対速度基準:ステージが進むほど唸りが高くなる
 
   for(const c of traffic){
@@ -785,24 +898,26 @@ function wrapMod(v, m){ return ((v % m) + m) % m; }
 function drawBackdrop(){
   const horizon = H*0.55;
 
-  // 空
+  // 空(100km以降、地平から藍とほのかな茜が差しはじめる)
   const sky = ctx.createLinearGradient(0,0,0,horizon);
-  sky.addColorStop(0,'#04060b');
-  sky.addColorStop(0.55,'#0c1019');
-  sky.addColorStop(0.88,'#181f30');
-  sky.addColorStop(1,'#232c42');
+  sky.addColorStop(0,    mixHex('#04060b', '#0a1126', dawnK));
+  sky.addColorStop(0.55, mixHex('#0c1019', '#17223e', dawnK));
+  sky.addColorStop(0.88, mixHex('#181f30', '#3a4364', dawnK));
+  sky.addColorStop(1,    mixHex('#232c42', '#6e4d52', dawnK));
   ctx.fillStyle = sky;
   ctx.fillRect(0,0,W,horizon);
 
-  // 星(瞬き)
+  // 星(瞬き/夜明けとともに薄れていく)
+  const starDim = 1 - dawnK*0.85;
   for(const st of stars){
-    const a = 0.25 + 0.55 * (0.5 + 0.5*Math.sin(globalT*st.sp + st.tw));
+    const a = (0.25 + 0.55 * (0.5 + 0.5*Math.sin(globalT*st.sp + st.tw))) * starDim;
     ctx.fillStyle = `rgba(200,210,235,${a})`;
     ctx.fillRect(st.x, st.y, st.r, st.r);
   }
 
-  // 月(三日月+ほのかな暈)
+  // 月(夜明けとともに淡くなる)
   const mx = W*0.76, my = H*0.14, mr = Math.min(W,H)*0.045;
+  ctx.globalAlpha = 1 - dawnK*0.5;
   const halo = ctx.createRadialGradient(mx,my,mr*0.4, mx,my,mr*4);
   halo.addColorStop(0,'rgba(220,228,245,0.10)');
   halo.addColorStop(1,'rgba(220,228,245,0)');
@@ -810,8 +925,12 @@ function drawBackdrop(){
   ctx.fillRect(mx-mr*4,my-mr*4,mr*8,mr*8);
   ctx.fillStyle = '#dfe5f2';
   ctx.beginPath(); ctx.arc(mx,my,mr,0,Math.PI*2); ctx.fill();
-  ctx.fillStyle = '#0c1019';
+  ctx.fillStyle = mixHex('#0c1019', '#17223e', dawnK);
   ctx.beginPath(); ctx.arc(mx-mr*0.42,my-mr*0.18,mr*0.92,0,Math.PI*2); ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // 流星
+  renderMeteors();
 
   // 遠い山並み(パララックス小)
   const rShift = wrapMod(bgShift*0.12, W*2);
@@ -844,11 +963,12 @@ function drawBackdrop(){
     }
   }
 
-  // 地平の靄(街の照り返し)
+  // 地平の靄(街の照り返し/夜明けとともにわずかに濃く、温かく)
+  const glowA = 0.085 + dawnK*0.09;
   const glow = ctx.createLinearGradient(0,horizon-H*0.07,0,horizon+H*0.02);
   glow.addColorStop(0,'rgba(242,163,60,0)');
-  glow.addColorStop(0.8,'rgba(242,163,60,0.085)');
-  glow.addColorStop(1,'rgba(242,163,60,0.02)');
+  glow.addColorStop(0.8,`rgba(242,163,60,${glowA})`);
+  glow.addColorStop(1,`rgba(242,163,60,${glowA*0.25})`);
   ctx.fillStyle = glow;
   ctx.fillRect(0,horizon-H*0.07,W,H*0.09);
 
@@ -1166,6 +1286,7 @@ function loop(t){
   lastTime = t;
   update(dt);
   updateParticles(dt);
+  updateMeteors(dt);
   render();
   requestAnimationFrame(loop);
 }
